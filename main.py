@@ -8,17 +8,20 @@ from zoneinfo import ZoneInfo
 import io, re, time
 import pandas as pd
 import numpy as np
-import requests
-import xml.etree.ElementTree as ET
-import yfinance as yf
+
+# Matplotlib (headless)
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.ticker import FuncFormatter
 
+import requests
+import xml.etree.ElementTree as ET
+import yfinance as yf
+
 # ================== Sabitler ==================
 IST = ZoneInfo("Europe/Istanbul")
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.1.0"
 
 TR_MONTHS = {
     "ocak":1,"şubat":2,"subat":2,"mart":3,"nisan":4,"mayıs":5,"mayis":5,
@@ -34,7 +37,7 @@ NUM_MAP = {
     "yüz":100,"yuz":100,"bin":1000,"milyon":1_000_000,"milyar":1_000_000_000
 }
 
-# Kur cache
+# Kur cache: (from,to) -> (rate, ts)
 _RATE_CACHE: dict[tuple[str,str], tuple[float, float]] = {}
 
 # ================== Yardımcılar ==================
@@ -53,11 +56,15 @@ def parse_amount(x: Union[str,int,float]) -> float:
     for token in ["₺"," tl"," tl."," try"," eur","€"," usd","$"," gbp","£"]:
         s = s.replace(token, "")
     s = re.sub(r"\s+", " ", s).strip()
+    # rakam varsa
     if re.search(r"\d", s):
         s2 = s.replace(".", "").replace(",", ".")
         m = re.findall(r"[-+]?\d*\.?\d+", s2)
-        if m: return float(m[0])
+        if m:
+            return float(m[0])
+    # yazıyla rakam
     tokens = re.findall(r"[a-zçğıöşü]+", s, flags=re.UNICODE)
+    if not tokens: raise ValueError(f"Tutar anlaşılamadı: {x}")
     total, current = 0, 0
     for t in tokens:
         if t not in NUM_MAP: continue
@@ -126,8 +133,10 @@ def _rate_tcmb(frm: str, to: str) -> Optional[float]:
     if frm == to: return 1.0
     root = _tcmb_today_xml()
     if not root: return None
+
     def x_to_try(code: str) -> Optional[float]:
         return 1.0 if code == "TRY" else _tcmb_try_per(code, root)
+
     if to == "TRY": return x_to_try(frm)
     if frm == "TRY":
         v = x_to_try(to);  return (1.0/v) if v else None
@@ -145,6 +154,14 @@ def _rate_yahoo(frm: str, to: str) -> Optional[float]:
         info = yf.Ticker(t).fast_info
         px = info.get("last_price")
         if px and float(px) > 0: return float(px)
+        inv = f"{to}{frm}=X"
+        hist2 = yf.Ticker(inv).history(period="1d")
+        if not hist2.empty:
+            v2 = float(hist2["Close"].iloc[-1])
+            return (1.0/v2) if v2 else None
+        info2 = yf.Ticker(inv).fast_info
+        px2 = info2.get("last_price")
+        if px2 and float(px2) > 0: return 1.0/float(px2)
     except: return None
     return None
 
@@ -154,10 +171,12 @@ def get_rate(frm: str, to: str, _depth: int = 0) -> float:
     key = (frm, to);  now = time.time()
     if key in _RATE_CACHE and now - _RATE_CACHE[key][1] < 600:
         return _RATE_CACHE[key][0]
+
     for fn in (_rate_tcmb, _rate_yahoo):
         r = fn(frm, to)
         if r:
             _RATE_CACHE[key] = (r, now);  return r
+
     if _depth == 0 and frm != "USD" and to != "USD":
         a = get_rate(frm, "USD", 1); b = get_rate("USD", to, 1)
         v = a*b; _RATE_CACHE[key] = (v, now); return v
@@ -168,12 +187,12 @@ class Transaction(BaseModel):
     date: str
     desc: str
     amount: Union[str, float, int]
-    currency: Optional[str]
-    type: Optional[str]
+    currency: Optional[str] = None
+    type: Optional[str] = None
 
 class CashflowRequest(BaseModel):
-    report_currency: Optional[str]
-    opening_cash: Optional[Union[str, float, int]]
+    report_currency: Optional[str] = None
+    opening_cash: Optional[Union[str, float, int]] = None
     transactions: List[Transaction] = []
 
 # ================== FastAPI ==================
@@ -220,59 +239,61 @@ def _process(payload: CashflowRequest):
         })
 
     if not rows:
-        return RPB_DISP, pd.DataFrame(), pd.DataFrame()
+        return RPB, RPB_DISP, pd.DataFrame(), pd.DataFrame()
 
     df = pd.DataFrame(rows).sort_values("Tarih2").reset_index(drop=True)
+
     def to_rpb(row):
         if row["_ccy"] == RPB: return row["_amt"]
         return row["_amt"] * get_rate(row["_ccy"], RPB)
+
     df["_RPB"] = df.apply(to_rpb, axis=1)
     df["_RPB_signed"] = np.where(df["Hareket"]=="Giriş", df["_RPB"], -df["_RPB"])
     df["Rapor Tutarı"] = df["_RPB_signed"].round().astype(int)
     df["Net Nakit"] = df["Rapor Tutarı"].cumsum()
+
+    # Özet
     grp = df.groupby("Tarih", sort=False).agg(
         Giriş=("Rapor Tutarı", lambda s: int(s[s>0].sum())),
         Çıkış=("Rapor Tutarı", lambda s: int(-s[s<0].sum())),
     ).reset_index()
     grp["Tarih2"] = pd.to_datetime(grp["Tarih"], format="%d.%m.%Y").dt.strftime("%Y.%m.%d")
     grp = grp.sort_values("Tarih2").reset_index(drop=True)
-    grp["Kümülatif"] = grp["Giriş"] - grp["Çıkış"]
-    grp["Kümülatif"] = grp["Kümülatif"].cumsum()
-    return RPB_DISP, df, grp
+    grp["Net Nakit"] = grp["Giriş"] - grp["Çıkış"]
+    grp["Kümülatif"] = grp["Net Nakit"].cumsum()
+
+    return RPB, RPB_DISP, df, grp
 
 # ================== Çıktılar ==================
-@app.post("/api/cashflow")
-def cashflow(req: CashflowRequest):
-    RPB_DISP, _, grp = _process(req)
+
+# 1) Özet JSON
+@app.post("/api/cashflow/summary")
+def cashflow_summary(req: CashflowRequest):
+    RPB, RPB_DISP, _, grp = _process(req)
     if grp.empty:
-        return JSONResponse(content={
-            "report_currency": RPB_DISP,
-            "summary_table": [],
-            "detail_csv_endpoint": "/api/cashflow/detail.csv",
-            "chart_png_endpoint": "/api/cashflow/chart.png"
-        })
+        return JSONResponse(content={"report_currency": RPB_DISP, "summary_table": []})
+
     R_IN, R_OUT, R_NET = f"Giriş ({RPB_DISP})", f"Çıkış ({RPB_DISP})", f"Net Nakit ({RPB_DISP})"
     disp = grp.copy()
     disp.rename(columns={"Giriş": R_IN, "Çıkış": R_OUT, "Kümülatif": R_NET}, inplace=True)
-    for c in [R_IN, R_OUT, R_NET]:
-        disp[c] = disp[c].astype(int).apply(tr_int_format)
+    for col in [R_IN, R_OUT, R_NET]:
+        disp[col] = disp[col].astype(int).apply(tr_int_format)
     summary = disp[["Tarih", R_IN, R_OUT, R_NET]].to_dict(orient="records")
-    summary.append({
+    # Toplam
+    total_row = {
         "Tarih": "Toplam",
         R_IN: tr_int_format(int(grp["Giriş"].sum())),
         R_OUT: tr_int_format(int(grp["Çıkış"].sum())),
         R_NET: tr_int_format(int(grp["Kümülatif"].iloc[-1] if not grp.empty else 0)),
-    })
-    return JSONResponse(content={
-        "report_currency": RPB_DISP,
-        "summary_table": summary,
-        "detail_csv_endpoint": "/api/cashflow/detail.csv",
-        "chart_png_endpoint": "/api/cashflow/chart.png"
-    })
+    }
+    summary.append(total_row)
 
+    return JSONResponse(content={"report_currency": RPB_DISP, "summary_table": summary})
+
+# 2) Detay CSV
 @app.post("/api/cashflow/detail.csv")
 def cashflow_detail_csv(req: CashflowRequest):
-    _, df, _ = _process(req)
+    _, _, df, _ = _process(req)
     cols = ["Tarih","Açıklama","Orijinal Tutar","Orijinal Para Birimi","Hareket","Rapor Tutarı","Net Nakit"]
     if df.empty:
         csv = ";".join(cols) + "\n"
@@ -285,10 +306,12 @@ def cashflow_detail_csv(req: CashflowRequest):
     return StreamingResponse(io.BytesIO(buf.getvalue().encode("utf-8-sig")), media_type="text/csv",
                              headers={"Content-Disposition": "attachment; filename=detay.csv"})
 
+# 3) Grafik PNG
 @app.post("/api/cashflow/chart.png")
 def cashflow_chart_png(req: CashflowRequest):
-    RPB_DISP, _, grp = _process(req)
+    RPB, RPB_DISP, _, grp = _process(req)
     fig, ax = plt.subplots(figsize=(10,5))
+
     if grp.empty:
         ax.text(0.5, 0.5, "Veri yok", ha="center", va="center")
         ax.axis("off")
@@ -303,14 +326,7 @@ def cashflow_chart_png(req: CashflowRequest):
         ax.plot(x, kum, label=f"Net Nakit ({RPB_DISP})", color="#424dc6", linewidth=2.0, marker="o")
         ax.set_xticks(x); ax.set_xticklabels(dates)
         ax.axhline(0, color="#999", linestyle="--", linewidth=1)
+
         def fmt(y,_): return tr_int_format(int(round(y)))
         ax.yaxis.set_major_formatter(FuncFormatter(fmt))
         ax.set_title(f"Nakit Akışı – Özet ({RPB_DISP})")
-        ax.legend(); ax.grid(True, axis="y", linestyle=":", alpha=0.3)
-    fig.tight_layout()
-    p = io.BytesIO()
-    plt.savefig(p, format="png", dpi=140, bbox_inches="tight")
-    plt.close(fig)
-    p.seek(0)
-    return StreamingResponse(p, media_type="image/png",
-                             headers={"Content-Disposition":"inline; filename=nakit_akisi.png"})
