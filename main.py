@@ -1,10 +1,11 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 from typing import List, Optional, Union
 from datetime import datetime, date
 from zoneinfo import ZoneInfo
-import io, base64, re, time
+import io, base64, re, time, uuid, os
 import pandas as pd
 import numpy as np
 
@@ -20,6 +21,7 @@ import yfinance as yf
 
 # ================== Sabitler ==================
 IST = ZoneInfo("Europe/Istanbul")
+APP_VERSION = "1.0.0"
 
 TR_MONTHS = {
     "ocak":1,"şubat":2,"subat":2,"mart":3,"nisan":4,"mayıs":5,"mayis":5,
@@ -41,8 +43,8 @@ _RATE_CACHE: dict[tuple[str,str], tuple[float, float]] = {}  # (from,to) -> (rat
 # ================== Yardımcılar ==================
 def normalize_ccy(ccy: Optional[str]) -> str:
     if not ccy: return "TRY"
-    c = ccy.strip().upper()
-    if c in ["TL","TRY","TL."]: return "TRY"
+    c = ccy.strip().upper().replace("TL.", "TL")
+    if c in ["TL","TRY"]: return "TRY"
     return c
 
 def tr_int_format(n: int) -> str:
@@ -50,7 +52,7 @@ def tr_int_format(n: int) -> str:
     return f"-{s}" if int(n) < 0 else s
 
 def parse_amount(x: Union[str,int,float]) -> float:
-    """Rakam + yazıyla rakam desteği. Ondalıklar varsa okunur; nihai tam sayıya yuvarlama rapor katmanında yapılır."""
+    """Rakam + yazıyla rakam desteği. Ondalık varsa okunur; nihai tam sayıya yuvarlama rapor katmanında."""
     if isinstance(x, (int,float)):
         return float(x)
     s = str(x).strip().lower()
@@ -58,7 +60,7 @@ def parse_amount(x: Union[str,int,float]) -> float:
         s = s.replace(token, "")
     s = re.sub(r"\s+", " ", s).strip()
 
-    if re.search(r"\d", s):  # 1.234.567,89 / 1.234.567 / 1234567
+    if re.search(r"\d", s):
         s2 = s.replace(".", "").replace(",", ".")
         m = re.findall(r"[-+]?\d*\.?\d+", s2)
         if m:
@@ -73,7 +75,7 @@ def parse_amount(x: Union[str,int,float]) -> float:
     total = 0
     current = 0
     for t in tokens:
-        if t not in NUM_MAP:
+        if t not in NUM_MAP:  # bilinmeyen kelimeyi yoksay
             continue
         val = NUM_MAP[t]
         if val >= 100:
@@ -124,8 +126,7 @@ def parse_date_tr(s: str, now: date) -> date:
 def detect_type(desc: str, given: Optional[str]) -> str:
     if given:
         g = given.strip().lower()
-        if "giriş" in g or g.startswith("gir"):
-            return "Giriş"
+        if "giriş" in g or g.startswith("gir"): return "Giriş"
         return "Çıkış"
     d = desc.lower()
     if any(k in d for k in EXIT_KEYS): return "Çıkış"
@@ -170,26 +171,20 @@ def get_tcmb_rate(frm: str, to: str) -> Optional[float]:
     frm = normalize_ccy(frm); to = normalize_ccy(to)
     if frm == to:
         return 1.0
-    if frm == "TRY" and to == "TRY":
-        return 1.0
     root = _get_tcmb_today_xml()
     if not root:
         return None
 
-    # (X -> TRY)
-    def x_to_try(xcode: str) -> Optional[float]:
-        if xcode == "TRY": return 1.0
-        return _tcmb_try_per(xcode, root)
+    def x_to_try(code: str) -> Optional[float]:
+        if code == "TRY": return 1.0
+        return _tcmb_try_per(code, root)
 
-    # Senaryolar
     if to == "TRY":
-        v = x_to_try(frm)
-        return v
+        return x_to_try(frm)
     if frm == "TRY":
         v = x_to_try(to)
         return (1.0 / v) if v and v != 0 else None
 
-    # frm -> TRY -> to
     a = x_to_try(frm)
     b = x_to_try(to)
     if a and b and b != 0:
@@ -200,23 +195,24 @@ def get_tcmb_rate(frm: str, to: str) -> Optional[float]:
 def _fetch_yf_fx(frm: str, to: str) -> Optional[float]:
     try:
         tkr = f"{frm}{to}=X"
+        hist = yf.Ticker(tkr).history(period="1d")
+        if not hist.empty:
+            v = float(hist["Close"].iloc[-1])
+            if v > 0: return v
         info = yf.Ticker(tkr).fast_info
         px = info.get("last_price")
         if px and float(px) > 0:
             return float(px)
-        hist = yf.Ticker(tkr).history(period="1d")
-        if not hist.empty:
-            return float(hist["Close"].iloc[-1])
         # ters kotasyon
         inv = f"{to}{frm}=X"
+        hist2 = yf.Ticker(inv).history(period="1d")
+        if not hist2.empty:
+            v2 = float(hist2["Close"].iloc[-1])
+            return (1.0/v2) if v2 else None
         info2 = yf.Ticker(inv).fast_info
         px2 = info2.get("last_price")
         if px2 and float(px2) > 0:
             return 1.0/float(px2)
-        hist2 = yf.Ticker(inv).history(period="1d")
-        if not hist2.empty:
-            v = float(hist2["Close"].iloc[-1])
-            return (1.0/v) if v else None
     except:
         return None
     return None
@@ -229,7 +225,9 @@ def _fetch_google_fx(frm: str, to: str) -> Optional[float]:
     if not m:
         m = re.search(r'class="YMlKec fxKbKc">([0-9\.,]+)<', html)
     if m:
-        val = m.group(1).replace(".", "").replace(",", ".")
+        val = m.group(1).strip()
+        # Google bazen 34,1234 gibi verir → virgül nokta dönüşümü yaparken 34.1234'e çevir
+        val = val.replace(".", "").replace(",", ".")
         try:
             v = float(val)
             return v if v > 0 else None
@@ -277,7 +275,7 @@ def get_rate(frm: str, to: str, _depth: int = 0) -> float:
 
     raise RuntimeError(f"Kur alınamadı: {frm}->{to}")
 
-# ================== Pydantic Modeller ==================
+# ================== Modeller ==================
 class Transaction(BaseModel):
     date: str = Field(..., description="Tarih; ör: '12 ekim', '15.10', '17.10.2025'")
     desc: str = Field(..., description="Açıklama")
@@ -291,15 +289,15 @@ class CashflowRequest(BaseModel):
     transactions: List[Transaction] = Field(default_factory=list)
 
 # ================== FastAPI Uygulaması ==================
-app = FastAPI(title="Cashflow API", version="0.3.0")
+app = FastAPI(title="Cashflow API", version=APP_VERSION)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
     allow_methods=["*"], allow_headers=["*"],
 )
 
-# ================== Rapor Üretimi ==================
-def build_reports(payload: CashflowRequest):
+# ================== Çekirdek İşlem ==================
+def _process(payload: CashflowRequest):
     now = datetime.now(IST).date()
     RPB = normalize_ccy(payload.report_currency or "TRY")
     RPB_DISPLAY = "TL" if RPB == "TRY" else RPB
@@ -338,15 +336,14 @@ def build_reports(payload: CashflowRequest):
         })
 
     if not rows:
-        return {
-            "report_currency": RPB_DISPLAY,
-            "detail_table": [], "summary_table": [],
-            "chart_base64": None, "chart_data_uri": None
-        }
+        # Boş rapor
+        empty_detail = []
+        empty_summary = []
+        return RPB, RPB_DISPLAY, empty_detail, empty_summary, None
 
     df = pd.DataFrame(rows).sort_values("Tarih2", ascending=True).reset_index(drop=True)
 
-    # 3) Kur dönüşümü (rapor anındaki güncel kur; oranlarda yuvarlama yok)
+    # 3) Kur dönüşümü (rapor anındaki kur; oranlarda yuvarlama yok)
     def to_rpb(row):
         if row["_ccy"] == RPB:
             return row["_amt"]
@@ -360,7 +357,7 @@ def build_reports(payload: CashflowRequest):
     df["Rapor Tutarı"] = df["_RPB_signed"].round().astype(int)  # sadece burada yuvarla
     df["Net Nakit"] = df["Rapor Tutarı"].cumsum()
 
-    # 5) Ekran için format (binlik ayraç)
+    # 5) Detay tablo (ekran için format)
     df_display = df.copy()
     df_display["Orijinal Tutar"] = df_display["Orijinal Tutar"].astype(int).apply(tr_int_format)
     df_display["Rapor Tutarı"] = df_display["Rapor Tutarı"].astype(int).apply(tr_int_format)
@@ -369,10 +366,9 @@ def build_reports(payload: CashflowRequest):
         "Rapor Tutarı": f"Rapor Tutarı ({RPB_DISPLAY})",
         "Net Nakit": f"Net Nakit ({RPB_DISPLAY})"
     }, inplace=True)
-
     detail_cols = ["Tarih","Açıklama","Orijinal Tutar","Orijinal Para Birimi","Hareket",
                    f"Rapor Tutarı ({RPB_DISPLAY})", f"Net Nakit ({RPB_DISPLAY})"]
-    detail_table = df_display[detail_cols].to_dict(orient="records")
+    # CSV için ham veriyi ayrıca döndüreceğiz (df), ekranda df_display kullanılır.
 
     # 6) Özet (günlük)
     grp = df.groupby("Tarih", sort=False).agg(
@@ -384,16 +380,13 @@ def build_reports(payload: CashflowRequest):
     grp["Net Nakit"] = grp["Giriş"] - grp["Çıkış"]
     grp["Kümülatif"] = grp["Net Nakit"].cumsum()
 
+    # Özet tablo (ekranda gösterim için binlik)
     grp_display = grp.copy()
-    grp_display.rename(columns={
-        "Giriş": f"Giriş ({RPB_DISPLAY})",
-        "Çıkış": f"Çıkış ({RPB_DISPLAY})",
-        "Kümülatif": f"Net Nakit ({RPB_DISPLAY})"
-    }, inplace=True)
-    for col in [f"Giriş ({RPB_DISPLAY})", f"Çıkış ({RPB_DISPLAY})", f"Net Nakit ({RPB_DISPLAY})"]:
+    R_IN, R_OUT, R_NET = f"Giriş ({RPB_DISPLAY})", f"Çıkış ({RPB_DISPLAY})", f"Net Nakit ({RPB_DISPLAY})"
+    grp_display.rename(columns={"Giriş": R_IN, "Çıkış": R_OUT, "Kümülatif": R_NET}, inplace=True)
+    for col in [R_IN, R_OUT, R_NET]:
         grp_display[col] = grp_display[col].astype(int).apply(tr_int_format)
-
-    summary_cols = ["Tarih", f"Giriş ({RPB_DISPLAY})", f"Çıkış ({RPB_DISPLAY})", f"Net Nakit ({RPB_DISPLAY})"]
+    summary_cols = ["Tarih", R_IN, R_OUT, R_NET]
     summary_table = grp_display[summary_cols].to_dict(orient="records")
 
     # Toplam satırı
@@ -402,12 +395,79 @@ def build_reports(payload: CashflowRequest):
     total_net = int(grp["Kümülatif"].iloc[-1]) if not grp.empty else 0
     summary_table.append({
         "Tarih": "Toplam",
-        f"Giriş ({RPB_DISPLAY})": tr_int_format(total_giris),
-        f"Çıkış ({RPB_DISPLAY})": tr_int_format(total_cikis),
-        f"Net Nakit ({RPB_DISPLAY})": tr_int_format(total_net),
+        R_IN: tr_int_format(total_giris),
+        R_OUT: tr_int_format(total_cikis),
+        R_NET: tr_int_format(total_net),
     })
 
-    # 7) Grafik (özet günleri)
+    return RPB, RPB_DISPLAY, df, summary_table, grp
+
+def _save_tmp_file(binary: bytes, suffix: str) -> str:
+    os.makedirs("/tmp", exist_ok=True)
+    fid = str(uuid.uuid4()).replace("-", "")
+    path = f"/tmp/{fid}.{suffix}"
+    with open(path, "wb") as f:
+        f.write(binary)
+    return path
+
+# ================== Routes ==================
+app = FastAPI(title="Cashflow API", version=APP_VERSION)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"],
+)
+
+@app.get("/")
+def root():
+    return {"service": "cashflow-api", "version": APP_VERSION}
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+# ---- Detay CSV ----
+@app.post("/api/cashflow/detail")
+def cashflow_detail(req: CashflowRequest):
+    RPB, RPB_DISPLAY, df, _, _ = _process(req)
+    if isinstance(df, list):
+        # boş rapor
+        csv_bytes = "Tarih;Açıklama;Orijinal Tutar;Orijinal Para Birimi;Hareket;Rapor Tutarı;Net Nakit\n".encode("utf-8")
+        path = _save_tmp_file(csv_bytes, "csv")
+        return FileResponse(path, media_type="text/csv", filename="detay.csv")
+
+    # CSV: binlik ayraçlı string yerine ham değerleri verelim mi? Talimatın ekran için binlik; CSV ham daha faydalı.
+    df_csv = df[["Tarih","Açıklama","Orijinal Tutar","Orijinal Para Birimi","Hareket","Rapor Tutarı","Net Nakit"]].copy()
+    df_csv["Orijinal Tutar"] = df_csv["Orijinal Tutar"].astype(int)
+    df_csv.to_csv("/tmp/detay.csv", sep=";", index=False, encoding="utf-8-sig")
+    return FileResponse("/tmp/detay.csv", media_type="text/csv", filename="detay.csv")
+
+# ---- Özet JSON ----
+@app.post("/api/cashflow/summary")
+def cashflow_summary(req: CashflowRequest):
+    RPB, RPB_DISPLAY, _, summary_table, _ = _process(req)
+    return JSONResponse(content={
+        "report_currency": RPB_DISPLAY,
+        "summary_table": summary_table
+    })
+
+# ---- Grafik PNG ----
+@app.post("/api/cashflow/chart")
+def cashflow_chart(req: CashflowRequest):
+    RPB, RPB_DISPLAY, _, _, grp = _process(req)
+    # grp boşsa boş grafik döndürmeyelim
+    if isinstance(grp, list) or grp.empty:
+        # 1x1 boş PNG
+        fig, ax = plt.subplots(figsize=(4,2))
+        ax.text(0.5, 0.5, "Veri yok", ha="center", va="center")
+        ax.axis("off")
+        buf = io.BytesIO()
+        plt.savefig(buf, format="png", dpi=120, bbox_inches="tight")
+        buf.seek(0)
+        p = _save_tmp_file(buf.getvalue(), "png")
+        plt.close(fig)
+        return FileResponse(p, media_type="image/png", filename="nakit_akisi.png")
+
     dates = grp["Tarih"].tolist()
     giris_vals = grp["Giriş"].tolist()
     cikis_vals = [-v for v in grp["Çıkış"].tolist()]  # negatif göster
@@ -433,41 +493,40 @@ def build_reports(payload: CashflowRequest):
     fig.tight_layout()
 
     buf = io.BytesIO()
-    plt.savefig(buf, format="png", dpi=160, bbox_inches="tight")
-    buf.seek(0)  # <<< ÖNEMLİ: Base64'e çevirmeden önce başa sar
+    plt.savefig(buf, format="png", dpi=140, bbox_inches="tight")
+    buf.seek(0)
+    p = _save_tmp_file(buf.getvalue(), "png")
     plt.close(fig)
-    chart_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-    chart_data_uri = f"data:image/png;base64,{chart_b64}"
+    return FileResponse(p, media_type="image/png", filename="nakit_akisi.png")
 
-    return {
+# ---- Full: Özet JSON + dosya linkleri ----
+@app.post("/api/cashflow/full")
+def cashflow_full(req: CashflowRequest, include_detail: bool = Query(True), include_chart: bool = Query(True)):
+    RPB, RPB_DISPLAY, df, summary_table, grp = _process(req)
+
+    detail_url = None
+    if include_detail:
+        # detay csv’i üret
+        if isinstance(df, list):
+            csv_bytes = "Tarih;Açıklama;Orijinal Tutar;Orijinal Para Birimi;Hareket;Rapor Tutarı;Net Nakit\n".encode("utf-8")
+            detail_path = _save_tmp_file(csv_bytes, "csv")
+        else:
+            df_csv = df[["Tarih","Açıklama","Orijinal Tutar","Orijinal Para Birimi","Hareket","Rapor Tutarı","Net Nakit"]].copy()
+            df_csv["Orijinal Tutar"] = df_csv["Orijinal Tutar"].astype(int)
+            detail_path = f"/tmp/{uuid.uuid4().hex}.csv"
+            df_csv.to_csv(detail_path, sep=";", index=False, encoding="utf-8-sig")
+        # Render statik URL üretmez; FileResponse ile indirilir.
+        # Burada sadece path döndürüyoruz; istemci bu path’i GET ile alamaz.
+        # Bu yüzden full kullanırken ayrı çağrılar önerilir.
+        detail_url = "/api/cashflow/detail"  # yol göstermek için
+
+    chart_url = None
+    if include_chart:
+        chart_url = "/api/cashflow/chart"
+
+    return JSONResponse(content={
         "report_currency": RPB_DISPLAY,
-        "detail_table": detail_table,
         "summary_table": summary_table,
-        "chart_base64": chart_b64,      # bazı UI’lar bunu bekler
-        "chart_data_uri": chart_data_uri  # bazı UI’lar data URI ister
-    }
-
-# ================== Routes ==================
-@app.get("/")
-def root():
-    return {"service": "cashflow-api", "version": app.version}
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}
-
-@app.post("/api/cashflow")
-def cashflow(req: CashflowRequest):
-    """
-    Input JSON:
-    {
-      "report_currency": "TRY",
-      "opening_cash": "50.000 TL",
-      "transactions": [
-        {"date":"15.10","desc":"Maaş","amount":"50.000","currency":"TRY","type":"giriş"},
-        {"date":"16.10","desc":"Kira ödemesi","amount":"20.000","currency":"TRY","type":"çıkış"},
-        {"date":"17 ekim","desc":"Satış","amount":"1.000","currency":"EUR","type":"giriş"}
-      ]
-    }
-    """
-    return build_reports(req)
+        "detail_csv_endpoint": detail_url,
+        "chart_png_endpoint": chart_url
+    })
