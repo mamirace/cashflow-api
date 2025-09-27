@@ -15,6 +15,7 @@ import matplotlib.pyplot as plt
 from matplotlib.ticker import FuncFormatter
 
 import requests
+import xml.etree.ElementTree as ET
 import yfinance as yf
 
 # ================== Sabitler ==================
@@ -40,8 +41,8 @@ _RATE_CACHE: dict[tuple[str,str], tuple[float, float]] = {}  # (from,to) -> (rat
 # ================== Yardımcılar ==================
 def normalize_ccy(ccy: Optional[str]) -> str:
     if not ccy: return "TRY"
-    c = ccy.strip().upper().replace("TL.", "TL")
-    if c in ["TL","TRY"]: return "TRY"
+    c = ccy.strip().upper()
+    if c in ["TL","TRY","TL."]: return "TRY"
     return c
 
 def tr_int_format(n: int) -> str:
@@ -49,17 +50,15 @@ def tr_int_format(n: int) -> str:
     return f"-{s}" if int(n) < 0 else s
 
 def parse_amount(x: Union[str,int,float]) -> float:
-    """Rakam + yazıyla rakam desteği. Ondalıklar yok sayılır; tam sayıya yakınsama rapor katmanında yapılacak."""
+    """Rakam + yazıyla rakam desteği. Ondalıklar varsa okunur; nihai tam sayıya yuvarlama rapor katmanında yapılır."""
     if isinstance(x, (int,float)):
         return float(x)
     s = str(x).strip().lower()
-    # semboller & kısaltmalar
     for token in ["₺"," tl"," tl."," try"," eur","€"," usd","$"," gbp","£"]:
         s = s.replace(token, "")
     s = re.sub(r"\s+", " ", s).strip()
 
-    # içinde rakam varsa: 1.234.567,89 / 1.234.567 / 1234567
-    if re.search(r"\d", s):
+    if re.search(r"\d", s):  # 1.234.567,89 / 1.234.567 / 1234567
         s2 = s.replace(".", "").replace(",", ".")
         m = re.findall(r"[-+]?\d*\.?\d+", s2)
         if m:
@@ -68,7 +67,6 @@ def parse_amount(x: Union[str,int,float]) -> float:
             except:
                 pass
 
-    # yazıyla rakam
     tokens = re.findall(r"[a-zçğıöşü]+", s, flags=re.UNICODE)
     if not tokens:
         raise ValueError(f"Tutar anlaşılamadı: {x}")
@@ -132,8 +130,7 @@ def detect_type(desc: str, given: Optional[str]) -> str:
     d = desc.lower()
     if any(k in d for k in EXIT_KEYS): return "Çıkış"
     if any(k in d for k in ENTRY_KEYS): return "Giriş"
-    # anahtar yoksa: gelir-kokluysa Giriş varsay
-    return "Giriş"
+    return "Giriş"  # varsayılan
 
 def _http_get(url: str, timeout: float = 6.0) -> Optional[str]:
     try:
@@ -145,22 +142,61 @@ def _http_get(url: str, timeout: float = 6.0) -> Optional[str]:
         return None
     return None
 
-def _fetch_google_fx(frm: str, to: str) -> Optional[float]:
-    # Google HTML; değişebilir — sadece ilk tercih
-    html = _http_get(f"https://www.google.com/finance/quote/{frm}-{to}")
-    if not html:
+# ---------- TCMB (Resmi) ----------
+def _get_tcmb_today_xml() -> Optional[ET.Element]:
+    try:
+        url = "https://www.tcmb.gov.tr/kurlar/today.xml"
+        resp = requests.get(url, timeout=6)
+        if resp.status_code == 200:
+            resp.encoding = "utf-8"
+            return ET.fromstring(resp.text)
+    except:
         return None
-    m = re.search(r'data-last-price="([0-9\.,]+)"', html)
-    if not m:
-        m = re.search(r'class="YMlKec fxKbKc">([0-9\.,]+)<', html)
-    if m:
-        val = m.group(1).replace(".", "").replace(",", ".")
-        try:
-            return float(val)
-        except:
-            return None
     return None
 
+def _tcmb_try_per(code: str, root: ET.Element) -> Optional[float]:
+    """TCMB ForexSelling TRY fiyatı: 1 birim 'code' kaç TRY eder."""
+    for currency in root.findall("Currency"):
+        if currency.attrib.get("CurrencyCode") == code:
+            txt = (currency.findtext("ForexSelling") or "").replace(",", ".")
+            try:
+                v = float(txt)
+                return v if v > 0 else None
+            except:
+                return None
+    return None
+
+def get_tcmb_rate(frm: str, to: str) -> Optional[float]:
+    frm = normalize_ccy(frm); to = normalize_ccy(to)
+    if frm == to:
+        return 1.0
+    if frm == "TRY" and to == "TRY":
+        return 1.0
+    root = _get_tcmb_today_xml()
+    if not root:
+        return None
+
+    # (X -> TRY)
+    def x_to_try(xcode: str) -> Optional[float]:
+        if xcode == "TRY": return 1.0
+        return _tcmb_try_per(xcode, root)
+
+    # Senaryolar
+    if to == "TRY":
+        v = x_to_try(frm)
+        return v
+    if frm == "TRY":
+        v = x_to_try(to)
+        return (1.0 / v) if v and v != 0 else None
+
+    # frm -> TRY -> to
+    a = x_to_try(frm)
+    b = x_to_try(to)
+    if a and b and b != 0:
+        return a / b
+    return None
+
+# ---------- Yahoo & Google yedek ----------
 def _fetch_yf_fx(frm: str, to: str) -> Optional[float]:
     try:
         tkr = f"{frm}{to}=X"
@@ -171,7 +207,7 @@ def _fetch_yf_fx(frm: str, to: str) -> Optional[float]:
         hist = yf.Ticker(tkr).history(period="1d")
         if not hist.empty:
             return float(hist["Close"].iloc[-1])
-        # ters kotasyon dene
+        # ters kotasyon
         inv = f"{to}{frm}=X"
         info2 = yf.Ticker(inv).fast_info
         px2 = info2.get("last_price")
@@ -180,41 +216,64 @@ def _fetch_yf_fx(frm: str, to: str) -> Optional[float]:
         hist2 = yf.Ticker(inv).history(period="1d")
         if not hist2.empty:
             v = float(hist2["Close"].iloc[-1])
-            if v != 0:
-                return 1.0/v
+            return (1.0/v) if v else None
     except:
         return None
     return None
 
+def _fetch_google_fx(frm: str, to: str) -> Optional[float]:
+    html = _http_get(f"https://www.google.com/finance/quote/{frm}-{to}")
+    if not html:
+        return None
+    m = re.search(r'data-last-price="([0-9\.,]+)"', html)
+    if not m:
+        m = re.search(r'class="YMlKec fxKbKc">([0-9\.,]+)<', html)
+    if m:
+        val = m.group(1).replace(".", "").replace(",", ".")
+        try:
+            v = float(val)
+            return v if v > 0 else None
+        except:
+            return None
+    return None
+
 def get_rate(frm: str, to: str, _depth: int = 0) -> float:
-    """En güncel kur: Google → Yahoo; olmazsa USD köprüsü (tek sefer). Cache 5dk."""
+    """Önce TCMB → sonra Yahoo → sonra Google. Olmazsa USD köprüsü (tek adım). 10 dk cache."""
     frm = normalize_ccy(frm); to = normalize_ccy(to)
     if frm == to: return 1.0
+
     key = (frm, to)
     now_ts = time.time()
-    # cache: 5 dk
     if key in _RATE_CACHE:
         val, ts = _RATE_CACHE[key]
-        if now_ts - ts < 300:
+        if now_ts - ts < 600:  # 10 dk
             return val
 
-    # 1) Google
+    # 1) TCMB
+    r = get_tcmb_rate(frm, to)
+    if r:
+        _RATE_CACHE[key] = (r, now_ts)
+        return r
+
+    # 2) Yahoo
+    r = _fetch_yf_fx(frm, to)
+    if r:
+        _RATE_CACHE[key] = (r, now_ts)
+        return r
+
+    # 3) Google
     r = _fetch_google_fx(frm, to)
     if r:
         _RATE_CACHE[key] = (r, now_ts)
         return r
-    # 2) Yahoo
-    r2 = _fetch_yf_fx(frm, to)
-    if r2:
-        _RATE_CACHE[key] = (r2, now_ts)
-        return r2
-    # 3) USD köprüsü (tek adım)
+
+    # 4) USD köprüsü (sadece 1 adım)
     if _depth == 0 and frm != "USD" and to != "USD":
         a = get_rate(frm, "USD", _depth=1)
         b = get_rate("USD", to, _depth=1)
-        r3 = a * b
-        _RATE_CACHE[key] = (r3, now_ts)
-        return r3
+        v = a * b
+        _RATE_CACHE[key] = (v, now_ts)
+        return v
 
     raise RuntimeError(f"Kur alınamadı: {frm}->{to}")
 
@@ -232,7 +291,7 @@ class CashflowRequest(BaseModel):
     transactions: List[Transaction] = Field(default_factory=list)
 
 # ================== FastAPI Uygulaması ==================
-app = FastAPI(title="Cashflow API", version="0.2.0")
+app = FastAPI(title="Cashflow API", version="0.3.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
@@ -278,12 +337,11 @@ def build_reports(payload: CashflowRequest):
             "_amt": float(amt),
         })
 
-    # Boşsa boş dön
     if not rows:
         return {
             "report_currency": RPB_DISPLAY,
             "detail_table": [], "summary_table": [],
-            "chart_base64": None
+            "chart_base64": None, "chart_data_uri": None
         }
 
     df = pd.DataFrame(rows).sort_values("Tarih2", ascending=True).reset_index(drop=True)
@@ -376,14 +434,17 @@ def build_reports(payload: CashflowRequest):
 
     buf = io.BytesIO()
     plt.savefig(buf, format="png", dpi=160, bbox_inches="tight")
+    buf.seek(0)  # <<< ÖNEMLİ: Base64'e çevirmeden önce başa sar
     plt.close(fig)
     chart_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+    chart_data_uri = f"data:image/png;base64,{chart_b64}"
 
     return {
         "report_currency": RPB_DISPLAY,
         "detail_table": detail_table,
         "summary_table": summary_table,
-        "chart_base64": chart_b64
+        "chart_base64": chart_b64,      # bazı UI’lar bunu bekler
+        "chart_data_uri": chart_data_uri  # bazı UI’lar data URI ister
     }
 
 # ================== Routes ==================
