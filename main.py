@@ -37,7 +37,7 @@ NUM_MAP = {
     "yüz":100,"yuz":100,"bin":1000,"milyon":1_000_000,"milyar":1_000_000_000
 }
 
-# Kur cache: (from,to) -> (rate, ts)
+# Kur cache
 _RATE_CACHE: dict[tuple[str,str], tuple[float, float]] = {}
 
 # ================== Yardımcılar ==================
@@ -201,6 +201,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, 
 
 @app.get("/")
 def root(): return {"service": "cashflow-api", "version": APP_VERSION}
+
 @app.get("/health")
 def health(): return {"status": "ok"}
 
@@ -266,7 +267,6 @@ def _process(payload: CashflowRequest):
 
 # ================== Çıktılar ==================
 
-# 1) Özet JSON
 @app.post("/api/cashflow/summary")
 def cashflow_summary(req: CashflowRequest):
     RPB, RPB_DISP, _, grp = _process(req)
@@ -290,7 +290,6 @@ def cashflow_summary(req: CashflowRequest):
 
     return JSONResponse(content={"report_currency": RPB_DISP, "summary_table": summary})
 
-# 2) Detay CSV
 @app.post("/api/cashflow/detail.csv")
 def cashflow_detail_csv(req: CashflowRequest):
     _, _, df, _ = _process(req)
@@ -306,7 +305,6 @@ def cashflow_detail_csv(req: CashflowRequest):
     return StreamingResponse(io.BytesIO(buf.getvalue().encode("utf-8-sig")), media_type="text/csv",
                              headers={"Content-Disposition": "attachment; filename=detay.csv"})
 
-# 3) Grafik PNG
 @app.post("/api/cashflow/chart.png")
 def cashflow_chart_png(req: CashflowRequest):
     RPB, RPB_DISP, _, grp = _process(req)
