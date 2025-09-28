@@ -1,28 +1,33 @@
-import io
-import re
-import time
-import base64
-import requests
-import numpy as np
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel
+from typing import List, Optional, Union
+from datetime import datetime, date
+from zoneinfo import ZoneInfo
+import io, re, time
 import pandas as pd
+import numpy as np
+
+# Matplotlib (headless)
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.ticker import FuncFormatter
+
+import requests
 import xml.etree.ElementTree as ET
 import yfinance as yf
-from datetime import datetime, date
-from zoneinfo import ZoneInfo
-from typing import List, Optional, Union
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
 
 # ================== Sabitler ==================
 IST = ZoneInfo("Europe/Istanbul")
 APP_VERSION = "1.1.0"
 
+TR_MONTHS = {
+    "ocak":1,"şubat":2,"subat":2,"mart":3,"nisan":4,"mayıs":5,"mayis":5,
+    "haziran":6,"temmuz":7,"ağustos":8,"agustos":8,"eylül":9,"eylul":9,
+    "ekim":10,"kasım":11,"kasim":11,"aralık":12,"aralik":12
+}
 ENTRY_KEYS = ["giriş","girış","tahsilat","alacak","maaş","maas","kira tahsilatı","borç tahsilatı","prim","satış","satis"]
 EXIT_KEYS  = ["çıkış","cıkış","cikis","ödeme","odeme","harcama","kredi kartı","kira ödemesi","konut kredisi","umre","fatura","taksit"]
 
@@ -32,16 +37,10 @@ NUM_MAP = {
     "yüz":100,"yuz":100,"bin":1000,"milyon":1_000_000,"milyar":1_000_000_000
 }
 
-TR_MONTHS = {
-    "ocak":1,"şubat":2,"subat":2,"mart":3,"nisan":4,"mayıs":5,"mayis":5,
-    "haziran":6,"temmuz":7,"ağustos":8,"agustos":8,"eylül":9,"eylul":9,
-    "ekim":10,"kasım":11,"kasim":11,"aralık":12,"aralik":12
-}
-
-# Cache
+# Kur cache: (from,to) -> (rate, ts)
 _RATE_CACHE: dict[tuple[str,str], tuple[float, float]] = {}
 
-# ================== Yardımcı Fonksiyonlar ==================
+# ================== Yardımcılar ==================
 def normalize_ccy(ccy: Optional[str]) -> str:
     if not ccy: return "TRY"
     c = ccy.strip().upper().replace("TL.", "TL")
@@ -57,10 +56,13 @@ def parse_amount(x: Union[str,int,float]) -> float:
     for token in ["₺"," tl"," tl."," try"," eur","€"," usd","$"," gbp","£"]:
         s = s.replace(token, "")
     s = re.sub(r"\s+", " ", s).strip()
+    # rakam varsa
     if re.search(r"\d", s):
         s2 = s.replace(".", "").replace(",", ".")
         m = re.findall(r"[-+]?\d*\.?\d+", s2)
-        if m: return float(m[0])
+        if m:
+            return float(m[0])
+    # yazıyla rakam
     tokens = re.findall(r"[a-zçğıöşü]+", s, flags=re.UNICODE)
     if not tokens: raise ValueError(f"Tutar anlaşılamadı: {x}")
     total, current = 0, 0
@@ -107,7 +109,7 @@ def detect_type(desc: str, given: Optional[str]) -> str:
     if any(k in d for k in EXIT_KEYS): return "Çıkış"
     return "Giriş"
 
-# Kur Çekme
+# ---------- TCMB ----------
 def _tcmb_today_xml() -> Optional[ET.Element]:
     try:
         r = requests.get("https://www.tcmb.gov.tr/kurlar/today.xml", timeout=6)
@@ -141,6 +143,7 @@ def _rate_tcmb(frm: str, to: str) -> Optional[float]:
     a, b = x_to_try(frm), x_to_try(to)
     return (a/b) if (a and b) else None
 
+# ---------- Yahoo ----------
 def _rate_yahoo(frm: str, to: str) -> Optional[float]:
     try:
         t = f"{frm}{to}=X"
@@ -249,6 +252,7 @@ def _process(payload: CashflowRequest):
     df["Rapor Tutarı"] = df["_RPB_signed"].round().astype(int)
     df["Net Nakit"] = df["Rapor Tutarı"].cumsum()
 
+    # Özet
     grp = df.groupby("Tarih", sort=False).agg(
         Giriş=("Rapor Tutarı", lambda s: int(s[s>0].sum())),
         Çıkış=("Rapor Tutarı", lambda s: int(-s[s<0].sum())),
@@ -260,36 +264,56 @@ def _process(payload: CashflowRequest):
 
     return RPB, RPB_DISP, df, grp
 
-# ================== Endpointler ==================
+# ================== Çıktılar ==================
 
-@app.post("/api/cashflow/full")
-def cashflow_full(req: CashflowRequest):
-    RPB, RPB_DISP, df, grp = _process(req)
-
-    # Özet tablo
-    summary = []
-    if not grp.empty:
-        for _, row in grp.iterrows():
-            summary.append({
-                "Tarih": row["Tarih"],
-                "Giriş": int(row["Giriş"]),
-                "Çıkış": int(row["Çıkış"]),
-                "Net": int(row["Kümülatif"])
-            })
-
-    # Detay CSV
-    csv = ""
-    if not df.empty:
-        cols = ["Tarih","Açıklama","Orijinal Tutar","Orijinal Para Birimi","Hareket","Rapor Tutarı","Net Nakit"]
-        buf = io.StringIO()
-        df[cols].to_csv(buf, sep=";", index=False)
-        csv = buf.getvalue()
-
-    # Grafik
-    chart_b64 = ""
-    fig, ax = plt.subplots(figsize=(10,5))
+# 1) Özet JSON
+@app.post("/api/cashflow/summary")
+def cashflow_summary(req: CashflowRequest):
+    RPB, RPB_DISP, _, grp = _process(req)
     if grp.empty:
-        ax.text(0.5,0.5,"Veri yok", ha="center", va="center")
+        return JSONResponse(content={"report_currency": RPB_DISP, "summary_table": []})
+
+    R_IN, R_OUT, R_NET = f"Giriş ({RPB_DISP})", f"Çıkış ({RPB_DISP})", f"Net Nakit ({RPB_DISP})"
+    disp = grp.copy()
+    disp.rename(columns={"Giriş": R_IN, "Çıkış": R_OUT, "Kümülatif": R_NET}, inplace=True)
+    for col in [R_IN, R_OUT, R_NET]:
+        disp[col] = disp[col].astype(int).apply(tr_int_format)
+    summary = disp[["Tarih", R_IN, R_OUT, R_NET]].to_dict(orient="records")
+    # Toplam
+    total_row = {
+        "Tarih": "Toplam",
+        R_IN: tr_int_format(int(grp["Giriş"].sum())),
+        R_OUT: tr_int_format(int(grp["Çıkış"].sum())),
+        R_NET: tr_int_format(int(grp["Kümülatif"].iloc[-1] if not grp.empty else 0)),
+    }
+    summary.append(total_row)
+
+    return JSONResponse(content={"report_currency": RPB_DISP, "summary_table": summary})
+
+# 2) Detay CSV
+@app.post("/api/cashflow/detail.csv")
+def cashflow_detail_csv(req: CashflowRequest):
+    _, _, df, _ = _process(req)
+    cols = ["Tarih","Açıklama","Orijinal Tutar","Orijinal Para Birimi","Hareket","Rapor Tutarı","Net Nakit"]
+    if df.empty:
+        csv = ";".join(cols) + "\n"
+        return StreamingResponse(io.BytesIO(csv.encode("utf-8-sig")), media_type="text/csv",
+                                 headers={"Content-Disposition": "attachment; filename=detay.csv"})
+    out = df[cols].copy()
+    out["Orijinal Tutar"] = out["Orijinal Tutar"].astype(int)
+    buf = io.StringIO()
+    out.to_csv(buf, sep=";", index=False)
+    return StreamingResponse(io.BytesIO(buf.getvalue().encode("utf-8-sig")), media_type="text/csv",
+                             headers={"Content-Disposition": "attachment; filename=detay.csv"})
+
+# 3) Grafik PNG
+@app.post("/api/cashflow/chart.png")
+def cashflow_chart_png(req: CashflowRequest):
+    RPB, RPB_DISP, _, grp = _process(req)
+    fig, ax = plt.subplots(figsize=(10,5))
+
+    if grp.empty:
+        ax.text(0.5, 0.5, "Veri yok", ha="center", va="center")
         ax.axis("off")
     else:
         dates = grp["Tarih"].tolist()
@@ -302,18 +326,15 @@ def cashflow_full(req: CashflowRequest):
         ax.plot(x, kum, label=f"Net Nakit ({RPB_DISP})", color="#424dc6", linewidth=2.0, marker="o")
         ax.set_xticks(x); ax.set_xticklabels(dates)
         ax.axhline(0, color="#999", linestyle="--", linewidth=1)
-        ax.yaxis.set_major_formatter(FuncFormatter(lambda y,_: tr_int_format(int(round(y)))))
-        ax.set_title(f"Nakit Akışı – Özet ({RPB_DISP})")
-        ax.legend()
-    buf = io.BytesIO()
-    plt.savefig(buf, format="png")
-    buf.seek(0)
-    chart_b64 = base64.b64encode(buf.read()).decode("utf-8")
-    plt.close(fig)
 
-    return {
-        "report_currency": RPB_DISP,
-        "summary_table": summary,
-        "detail_csv": csv,
-        "chart_png_base64": chart_b64
-    }
+        def fmt(y,_): return tr_int_format(int(round(y)))
+        ax.yaxis.set_major_formatter(FuncFormatter(fmt))
+        ax.set_title(f"Nakit Akışı – Özet ({RPB_DISP})")
+
+    ax.legend()
+    buf = io.BytesIO()
+    plt.tight_layout()
+    plt.savefig(buf, format="png")
+    plt.close(fig)
+    buf.seek(0)
+    return StreamingResponse(buf, media_type="image/png")
