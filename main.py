@@ -305,34 +305,32 @@ def cashflow_detail_csv(req: CashflowRequest):
     return StreamingResponse(io.BytesIO(buf.getvalue().encode("utf-8-sig")), media_type="text/csv",
                              headers={"Content-Disposition": "attachment; filename=detay.csv"})
 
-@app.post("/api/cashflow/chart.png")
-def cashflow_chart_png(req: CashflowRequest):
+@app.post("/api/cashflow/chart.code")
+def cashflow_chart_code(req: CashflowRequest):
     RPB, RPB_DISP, _, grp = _process(req)
-    fig, ax = plt.subplots(figsize=(10,5))
 
     if grp.empty:
-        ax.text(0.5, 0.5, "Veri yok", ha="center", va="center")
-        ax.axis("off")
-    else:
-        dates = grp["Tarih"].tolist()
-        giris = grp["Giriş"].tolist()
-        cikis = [-v for v in grp["Çıkış"].tolist()]
-        kum = grp["Kümülatif"].tolist()
-        x = np.arange(len(dates))
-        ax.bar(x-0.2, giris, width=0.4, label=f"Giriş ({RPB_DISP})", color="#2dba1e")
-        ax.bar(x+0.2, cikis, width=0.4, label=f"Çıkış ({RPB_DISP})", color="#fe0101")
-        ax.plot(x, kum, label=f"Net Nakit ({RPB_DISP})", color="#424dc6", linewidth=2.0, marker="o")
-        ax.set_xticks(x); ax.set_xticklabels(dates)
-        ax.axhline(0, color="#999", linestyle="--", linewidth=1)
+        return JSONResponse(content={"code": "print('Veri yok')"})
 
-        def fmt(y,_): return tr_int_format(int(round(y)))
-        ax.yaxis.set_major_formatter(FuncFormatter(fmt))
-        ax.set_title(f"Nakit Akışı – Özet ({RPB_DISP})")
+    code = f"""
+import matplotlib.pyplot as plt
+import numpy as np
 
-    ax.legend()
-    buf = io.BytesIO()
-    plt.tight_layout()
-    plt.savefig(buf, format="png")
-    plt.close(fig)
-    buf.seek(0)
-    return StreamingResponse(buf, media_type="image/png")
+dates = {grp['Tarih'].tolist()}
+giris = {grp['Giriş'].tolist()}
+cikis = {[ -v for v in grp['Çıkış'].tolist() ]}
+kum = {grp['Kümülatif'].tolist()}
+x = np.arange(len(dates))
+
+plt.figure(figsize=(10,5))
+plt.bar(x-0.2, giris, width=0.4, label="Giriş ({RPB_DISP})", color="#2dba1e")
+plt.bar(x+0.2, cikis, width=0.4, label="Çıkış ({RPB_DISP})", color="#fe0101")
+plt.plot(x, kum, label="Net Nakit ({RPB_DISP})", color="#424dc6", linewidth=2.0, marker="o")
+plt.xticks(x, dates)
+plt.axhline(0, color="#999", linestyle="--", linewidth=1)
+plt.legend()
+plt.title("Nakit Akışı – Özet ({RPB_DISP})")
+plt.show()
+"""
+    return JSONResponse(content={"code": code})
+
